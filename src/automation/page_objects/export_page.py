@@ -138,6 +138,16 @@ class ExportPage(BasePage):
         logger.info("Iniciando o download dos arquivos exportados...")
         pending_dir = settings.PENDING_DIR
 
+        # Remover resíduos de downloads incompletos de execuções anteriores.
+        stale_temp_files = [f for f in pending_dir.glob('*') if f.suffix in ('.crdownload', '.part', '.tmp')]
+        if stale_temp_files:
+            for temp_file in stale_temp_files:
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning(f"Não foi possível remover arquivo temporário antigo '{temp_file.name}': {e}")
+            logger.info(f"Arquivos temporários antigos removidos: {[f.name for f in stale_temp_files]}")
+
         # Limpar arquivos antigos do diretório pending antes de iniciar o download
         existing_files_before = set(pending_dir.glob('*'))
         logger.info(f"Arquivos existentes em pending antes do download: {[f.name for f in existing_files_before]}")
@@ -223,40 +233,103 @@ class ExportPage(BasePage):
         logger.info(f"Monitorando diretório de downloads por até {timeout_seconds} segundos...")
         start_time = time.time()
         download_detected = False
+        no_temp_files_since = None
+
+        # Snapshot inicial por nome para detectar sobrescrita de arquivo existente.
+        initial_snapshot = {}
+        for file_path in files_before:
+            try:
+                stat = file_path.stat()
+                initial_snapshot[file_path.name] = {
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "is_dir": file_path.is_dir(),
+                }
+            except FileNotFoundError:
+                continue
+
+        # Controle de estabilidade para evitar considerar arquivo ainda em escrita como concluído.
+        candidate_stability = {}
 
         while time.time() - start_time < timeout_seconds:
-            current_files = set(pending_dir.glob('*'))
-            new_files = current_files - files_before
+            current_files = list(pending_dir.glob('*'))
 
-            # Verificar downloads em andamento (Chrome usa .crdownload, Firefox usa .part)
-            downloading_files = [f for f in new_files if f.suffix in ('.crdownload', '.part', '.tmp')]
-            completed_zips = [f for f in new_files if f.suffix == '.zip']
+            temp_files = [f for f in current_files if f.suffix in ('.crdownload', '.part', '.tmp')]
+            non_temp_files = [f for f in current_files if f not in temp_files]
 
-            if downloading_files:
-                if not download_detected:
-                    logger.info(f"📥 Download detectado! Arquivo(s) em progresso: {[f.name for f in downloading_files]}")
-                    download_detected = True
-                else:
-                    sizes = {f.name: f.stat().st_size for f in downloading_files if f.exists()}
-                    logger.debug(f"Download em progresso... Tamanhos: {sizes}")
+            changed_or_new_files = []
+            candidate_artifacts = []
 
-            if completed_zips:
-                # Verificar se o arquivo está estável (tamanho não muda)
-                zip_file = completed_zips[0]
-                size_1 = zip_file.stat().st_size
-                time.sleep(3)
-                
-                if not zip_file.exists():
-                    logger.debug("Arquivo ZIP desapareceu (pode ter sido renomeado). Continuando monitoramento...")
+            for f in non_temp_files:
+                try:
+                    stat = f.stat()
+                except FileNotFoundError:
                     continue
 
-                size_2 = zip_file.stat().st_size
+                current_meta = {
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "is_dir": f.is_dir(),
+                }
 
-                if size_1 == size_2 and size_2 > 0:
-                    logger.info(f"✅ Download concluído: {zip_file.name} ({size_2:,} bytes)")
-                    return
+                baseline_meta = initial_snapshot.get(f.name)
+                is_new = baseline_meta is None
+                is_changed = baseline_meta is not None and current_meta != baseline_meta
+
+                if is_new or is_changed:
+                    changed_or_new_files.append(f)
+                    if f.suffix == '.zip' or f.is_dir():
+                        candidate_artifacts.append((f, current_meta))
+
+            if temp_files:
+                if not download_detected:
+                    logger.info(f"📥 Download detectado! Arquivo(s) em progresso: {[f.name for f in temp_files]}")
+                    download_detected = True
                 else:
-                    logger.info(f"Arquivo ZIP ainda sendo escrito... ({size_1} -> {size_2} bytes)")
+                    sizes = {f.name: f.stat().st_size for f in temp_files if f.exists()}
+                    logger.debug(f"Download em progresso... Tamanhos: {sizes}")
+                no_temp_files_since = None
+
+            if changed_or_new_files and not download_detected:
+                logger.info(f"📥 Atividade de download detectada por arquivos novos/atualizados: {[f.name for f in changed_or_new_files]}")
+                download_detected = True
+
+            if download_detected and not temp_files and no_temp_files_since is None:
+                no_temp_files_since = time.time()
+
+            if download_detected and candidate_artifacts:
+                for candidate_file, current_meta in candidate_artifacts:
+                    previous_meta = candidate_stability.get(candidate_file.name)
+                    previous_base_meta = None
+                    if previous_meta:
+                        previous_base_meta = {
+                            "size": previous_meta.get("size"),
+                            "mtime": previous_meta.get("mtime"),
+                            "is_dir": previous_meta.get("is_dir"),
+                        }
+
+                    if previous_base_meta == current_meta:
+                        candidate_stability[candidate_file.name] = {
+                            **current_meta,
+                            "stable_hits": candidate_stability[candidate_file.name].get("stable_hits", 1) + 1,
+                        }
+                    else:
+                        candidate_stability[candidate_file.name] = {
+                            **current_meta,
+                            "stable_hits": 1,
+                        }
+
+                stable_candidates = [
+                    name for name, meta in candidate_stability.items()
+                    if meta.get("stable_hits", 0) >= 2 and meta.get("size", 0) > 0
+                ]
+
+                if stable_candidates and no_temp_files_since and (time.time() - no_temp_files_since) >= 6:
+                    logger.info(f"✅ Download concluído. Artefatos estáveis detectados: {stable_candidates}")
+                    return
+
+            if download_detected and not temp_files and not candidate_artifacts:
+                logger.debug("Downloads temporários finalizaram, aguardando estabilização de artefatos finais...")
 
             elapsed = int(time.time() - start_time)
             if elapsed > 0 and elapsed % 30 == 0:
