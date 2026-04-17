@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     
     page_load_timeout: int = Field(default=30, ge=5, le=120)
     implicit_wait: int = Field(default=10, ge=1, le=60)
-    download_timeout: int = Field(default=300, ge=60, le=600)
+    download_timeout: int = Field(default=900, ge=60, le=3600)
     default_timeout: int = Field(default=30)
     
     log_level: str = Field(default="INFO")
