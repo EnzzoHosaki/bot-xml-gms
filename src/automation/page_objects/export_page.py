@@ -1,4 +1,5 @@
 #page_objects/export_page.py
+import shutil
 import time
 import logging
 from pathlib import Path
@@ -162,9 +163,21 @@ class ExportPage(BasePage):
                     logger.warning(f"Não foi possível remover arquivo temporário antigo '{temp_file.name}': {e}")
             logger.info(f"Arquivos temporários antigos removidos: {[f.name for f in stale_temp_files]}")
 
-        # Limpar arquivos antigos do diretório pending antes de iniciar o download
+        # Limpar arquivos residuais de execuções anteriores para evitar colisão de nomes.
+        residual_files = [f for f in pending_dir.glob('*') if f.suffix not in ('.crdownload', '.part', '.tmp')]
+        if residual_files:
+            for residual in residual_files:
+                try:
+                    if residual.is_dir():
+                        shutil.rmtree(residual)
+                    else:
+                        residual.unlink()
+                except Exception as e:
+                    logger.warning(f"Não foi possível remover arquivo residual '{residual.name}': {e}")
+            logger.info(f"Arquivos residuais removidos de pending: {[f.name for f in residual_files]}")
+
         existing_files_before = set(pending_dir.glob('*'))
-        logger.info(f"Arquivos existentes em pending antes do download: {[f.name for f in existing_files_before]}")
+        logger.info(f"Arquivos em pending antes do download: {[f.name for f in existing_files_before]}")
 
         try:
             with self.switch_to_iframe(self.selectors['legado_frame']):
@@ -182,19 +195,23 @@ class ExportPage(BasePage):
                 row_classes = first_row_element.get_attribute("class") or ""
                 logger.info(f"Classes da linha após clique: '{row_classes}'")
 
-                # Tentar também clicar no checkbox/input da linha se existir
+                # Tentar também clicar no checkbox/input da linha se existir.
+                # O Kendo UI oculta o <input> com CSS — usa JS como fallback se Selenium falhar.
                 try:
                     checkbox_selector = f"({self.selectors['table_rows']})[3]//input[@type='checkbox']"
                     if self.is_element_present(checkbox_selector, timeout=2):
-                        self.click(checkbox_selector)
-                        logger.info("Checkbox da linha clicado.")
                         _cb_by = self._get_by(checkbox_selector)
+                        checkbox_el = self.driver.find_element(_cb_by, checkbox_selector)
                         try:
-                            WebDriverWait(self.driver, 2).until(EC.element_to_be_clickable((_cb_by, checkbox_selector)))
+                            WebDriverWait(self.driver, 5).until(
+                                EC.element_to_be_clickable((_cb_by, checkbox_selector))
+                            )
+                            checkbox_el.click()
                         except TimeoutException:
-                            pass
-                except Exception:
-                    logger.debug("Nenhum checkbox encontrado na linha (pode não ser necessário).")
+                            self.driver.execute_script("arguments[0].click();", checkbox_el)
+                        logger.info("Checkbox da linha clicado.")
+                except Exception as e:
+                    logger.debug(f"Nenhum checkbox encontrado ou não foi possível clicar ({e}).")
 
                 download_button_selector = self.selectors['download_button']
                 self.wait_for_element(download_button_selector)
