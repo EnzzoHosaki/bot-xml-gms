@@ -6,7 +6,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from .base_page import BasePage
 from config import settings
 from src.utils.exceptions import NoInvoicesFoundException
@@ -47,9 +47,20 @@ class ExportPage(BasePage):
                             try:
                                 self.send_keys(self.selectors['stores_input'], str(store_code))
                                 option_selector = f"//li[@role='option' and contains(., '{store_code}')]"
-                                self.click(option_selector)
+                                _by = self._get_by(option_selector)
+                                # O dropdown re-renderiza após cada seleção; retry protege contra StaleElementReference
+                                for _attempt in range(3):
+                                    try:
+                                        el = WebDriverWait(self.driver, settings.DEFAULT_TIMEOUT).until(
+                                            EC.element_to_be_clickable((_by, option_selector))
+                                        )
+                                        el.click()
+                                        break
+                                    except StaleElementReferenceException:
+                                        if _attempt == 2:
+                                            raise
                                 logger.info(f"Loja '{store_code}' selecionada com sucesso.")
-                                
+
                             except Exception as e:
                                 logger.error(f"Não foi possível selecionar a loja '{store_code}': {e}")
                                 raise
