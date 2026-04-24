@@ -7,6 +7,8 @@ venv/
 
 # 2. Arquivos de Credenciais e Configurações Sensíveis
 .env
+params.json
+CLAUDE.md
 
 # 3. Cache e Arquivos Compilados do Python
 __pycache__/
