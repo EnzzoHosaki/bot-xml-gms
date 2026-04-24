@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     
     base_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
     chrome_driver_path: Optional[str] = None
+    headless: bool = Field(default=True)
     
     page_load_timeout: int = Field(default=30, ge=5, le=120)
     implicit_wait: int = Field(default=10, ge=1, le=60)

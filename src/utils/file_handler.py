@@ -280,7 +280,7 @@ def process_downloaded_files(document_type: str, start_date: str, end_date: str)
         
         summary = analyze_xml_files_and_log_summary(source_folders_parent)
 
-        folders_to_move = [d for d in source_folders_parent.iterdir() if d.is_dir()]
+        items_to_move = list(source_folders_parent.iterdir())
 
         try:
             day, month, year = start_date.split('/')
@@ -303,16 +303,15 @@ def process_downloaded_files(document_type: str, start_date: str, end_date: str)
 
         final_destination_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Diretório de destino criado/verificado: '{final_destination_path}'")
-        
-        if not folders_to_move:
-            logger.warning("A pasta de origem está vazia. Nenhuma pasta para mover.")
+
+        if not items_to_move:
+            logger.warning("A pasta de origem está vazia. Nenhuma pasta ou arquivo para mover.")
             operation_successful = True
         else:
-            logger.info(f"Movendo {len(folders_to_move)} pastas para o destino final...")
-            for folder in folders_to_move:
-                destination_for_folder = final_destination_path / folder.name
-                shutil.move(str(folder), str(destination_for_folder))
-            logger.info("✅ Pastas movidas com sucesso!")
+            logger.info(f"Movendo {len(items_to_move)} item(ns) para o destino final...")
+            for item in items_to_move:
+                shutil.move(str(item), str(final_destination_path / item.name))
+            logger.info("✅ Itens movidos com sucesso!")
             operation_successful = True
 
     except Exception as e:

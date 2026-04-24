@@ -6,6 +6,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from .base_page import BasePage
 from config import settings
 from src.utils.exceptions import NoInvoicesFoundException
@@ -46,8 +47,6 @@ class ExportPage(BasePage):
                             try:
                                 self.send_keys(self.selectors['stores_input'], str(store_code))
                                 option_selector = f"//li[@role='option' and contains(., '{store_code}')]"
-                                self.wait_for_element(option_selector)
-                                time.sleep(0.5)
                                 self.click(option_selector)
                                 logger.info(f"Loja '{store_code}' selecionada com sucesso.")
                                 
@@ -59,7 +58,6 @@ class ExportPage(BasePage):
                     self.click( self.selectors['popup_header'])
                     self.click(self.selectors['export_button'])
                     logger.info("Clique no botão de exportar realizado.")
-                    time.sleep(1)
                     if self.is_element_present(self.selectors['alert_msg'], timeout=settings.DEFAULT_TIMEOUT // 10):
                         alert_element = self._find_element(self.selectors['alert_msg'])
                         if "Não existem notas a serem exportadas para esse filtro." in alert_element.text:
@@ -130,7 +128,12 @@ class ExportPage(BasePage):
             with self.switch_to_iframe(self.selectors['legado_frame']):
                 self.wait_for_element(self.selectors['search_button'])
                 self.click(self.selectors['search_button'])
-                time.sleep(3)  # Aguardar a tabela ser recarregada após o clique em pesquisar
+                _row_sel = f"({self.selectors['table_rows']})[3]"
+                _by = self._get_by(_row_sel)
+                try:
+                    WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((_by, _row_sel)))
+                except TimeoutException:
+                    pass  # Tabela pode estar vazia, o loop externo verificará
                 
         raise TimeoutError(f"A exportação não foi concluída no tempo limite de {minutes} minutos.")
     
@@ -160,7 +163,8 @@ class ExportPage(BasePage):
                 # Clicar na linha para selecioná-la
                 logger.info("Clicando na primeira linha da tabela para selecioná-la...")
                 self.click(first_row_selector)
-                time.sleep(1)
+                _by = self._get_by(first_row_selector)
+                WebDriverWait(self.driver, 3).until(EC.presence_of_element_located((_by, first_row_selector)))
 
                 # Verificar se a linha foi selecionada (class 'selected' ou similar)
                 first_row_element = self._find_element(first_row_selector)
@@ -173,7 +177,11 @@ class ExportPage(BasePage):
                     if self.is_element_present(checkbox_selector, timeout=2):
                         self.click(checkbox_selector)
                         logger.info("Checkbox da linha clicado.")
-                        time.sleep(0.5)
+                        _cb_by = self._get_by(checkbox_selector)
+                        try:
+                            WebDriverWait(self.driver, 2).until(EC.element_to_be_clickable((_cb_by, checkbox_selector)))
+                        except TimeoutException:
+                            pass
                 except Exception:
                     logger.debug("Nenhum checkbox encontrado na linha (pode não ser necessário).")
 
@@ -193,17 +201,15 @@ class ExportPage(BasePage):
                 self.click(download_button_selector)
                 logger.info("Clique no botão de download realizado.")
 
-                # Aguardar um momento para ver se algum diálogo/alerta aparece
-                time.sleep(2)
-
-                # Verificar se há algum alert do browser
+                # Aguardar possível alert do browser com WebDriverWait
                 try:
+                    WebDriverWait(self.driver, 3).until(EC.alert_is_present())
                     alert = self.driver.switch_to.alert
                     alert_text = alert.text
                     logger.info(f"Alert detectado após click no download: '{alert_text}'")
                     alert.accept()
                     logger.info("Alert aceito.")
-                except Exception:
+                except TimeoutException:
                     logger.debug("Nenhum alert do browser detectado após click no download.")
 
         except Exception as e:

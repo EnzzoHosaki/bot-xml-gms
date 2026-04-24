@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class BotRunner:
     def __init__(self, params: dict, job_id: str = None, log_callback: Callable = None):
-        self.headless = params.get('headless', True)
+        self.headless = params.get('headless', config_settings.headless)
         self.stores_to_process = params.get('stores', [])
         self.document_type = params.get('document_type')
         self.emitter = params.get('emitter')
@@ -143,8 +143,8 @@ class BotRunner:
                     try:
                         if self.browser_handler and self.browser_handler.driver:
                             self.browser_handler.close_browser()
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Falha ao fechar navegador durante retry: {e}")
                     
                     if attempt < MAX_BROWSER_RETRIES:
                         import time

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from config import settings
 from src.core.bot_runner import BotRunner
+from src.utils.exceptions import ConfigurationError, ElementNotFoundError, LoginError
 
 logging.config.dictConfig(settings.get_log_config())
 logger = logging.getLogger(__name__)
@@ -157,7 +158,7 @@ class RabbitMQWorker:
             self.report_log(job_id, "INFO", f"Job {job_id} iniciado. Preparando execução...")
             
             bot_params = {
-                'headless': params.get('headless', True),
+                'headless': params.get('headless', settings.headless),
                 'stores': params.get('stores', []),
                 'document_type': params.get('document_type'),
                 'emitter': params.get('emitter', 'Qualquer'),
@@ -225,7 +226,7 @@ class RabbitMQWorker:
             
         except Exception as e:
             logger.error(f"❌ Erro ao processar mensagem: {e}", exc_info=True)
-            
+
             if job_id:
                 try:
                     self.report_log(job_id, "ERROR", f"Erro inesperado: {str(e)}")
@@ -237,8 +238,16 @@ class RabbitMQWorker:
                     logger.critical(f"❌ FALHA CRÍTICA ao reportar falha ao Maestro (problema de conexão/rede): {api_error}", exc_info=True)
                 except Exception as unexpected_error:
                     logger.critical(f"❌ FALHA CRÍTICA ao reportar falha ao Maestro (erro inesperado): {unexpected_error}", exc_info=True)
-            
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+            # Falhas transitórias (rede, browser, timeout) são requeue=True para nova tentativa.
+            # Falhas permanentes (config inválida, seletor não encontrado, credenciais) são requeue=False.
+            _PERMANENT_EXCEPTIONS = (ConfigurationError, ElementNotFoundError, LoginError)
+            is_transient = isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(e, _PERMANENT_EXCEPTIONS)
+            if is_transient:
+                logger.warning(f"⚠️ Falha transitória detectada ({type(e).__name__}). Mensagem será reprocessada.")
+            else:
+                logger.error(f"❌ Falha permanente detectada ({type(e).__name__}). Mensagem descartada.")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=is_transient)
     
     def start(self):
         logger.info("=" * 60)

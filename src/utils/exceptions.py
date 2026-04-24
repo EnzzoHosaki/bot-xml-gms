@@ -24,6 +24,6 @@ class ConfigurationError(AutomationException):
     """Lançada quando há erro ao carregar configurações (selectors, env, etc)."""
     pass
 
-class NoInvoicesFoundException(Exception):
+class NoInvoicesFoundException(AutomationException):
     """Exceção levantada quando nenhuma nota fiscal é encontrada para os filtros de exportação."""
     pass

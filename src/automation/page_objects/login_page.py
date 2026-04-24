@@ -1,5 +1,4 @@
 import logging
-import time
 from urllib.parse import urlparse
 from selenium.webdriver.remote.webdriver import WebDriver
 from .base_page import BasePage
@@ -26,7 +25,6 @@ class LoginPage(BasePage):
             logger.info("Preenchendo credenciais de login.")
             self.send_keys(self.selectors['username_input'], username)
             self.send_keys(self.selectors['password_input'], password)
-            time.sleep(1)
             self.click(self.selectors['login_button'])
 
             logger.info("Verificando se o login foi bem-sucedido...")
