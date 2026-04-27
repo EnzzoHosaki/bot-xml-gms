@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -26,6 +27,10 @@ class BrowserHandler:
             "safebrowsing.enabled": True,
         }
         chrome_options.add_experimental_option("prefs", prefs)
+        chrome_options.set_capability('goog:loggingPrefs', {
+            'browser': 'ALL',
+            'performance': 'ALL',
+        })
 
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
@@ -59,6 +64,13 @@ class BrowserHandler:
             })
             logger.info(f"Download configurado via CDP para: {download_dir}")
 
+            # Habilitar domínio Network do CDP para capturar eventos de rede nos performance logs
+            try:
+                self.driver.execute_cdp_cmd("Network.enable", {})
+                logger.debug("CDP Network domain habilitado.")
+            except Exception as cdp_err:
+                logger.debug(f"Não foi possível habilitar CDP Network domain: {cdp_err}")
+
             logger.info("Navegador iniciado com sucesso.")
             return self.driver
         
@@ -82,6 +94,58 @@ class BrowserHandler:
         except Exception as e:
             logger.error(f"Falha ao capturar screenshot: {e}")
             return None
+
+    def get_browser_console_logs(self) -> list:
+        """Returns and clears browser console log entries (one-time read)."""
+        if not self.driver:
+            return []
+        try:
+            return self.driver.get_log('browser')
+        except Exception as e:
+            logger.debug(f"Logs do console do browser indisponíveis: {e}")
+            return []
+
+    def get_performance_logs(self) -> list:
+        """Returns and clears CDP performance log entries (one-time read)."""
+        if not self.driver:
+            return []
+        try:
+            return self.driver.get_log('performance')
+        except Exception as e:
+            logger.debug(f"Logs de performance indisponíveis: {e}")
+            return []
+
+    def log_browser_diagnostics(self, context: str = "") -> None:
+        """Logs browser console errors/warnings and relevant CDP network events."""
+        prefix = f"[{context}] " if context else ""
+
+        browser_logs = self.get_browser_console_logs()
+        if browser_logs:
+            errors = [e for e in browser_logs if e.get('level') in ('SEVERE', 'WARNING')]
+            if errors:
+                for entry in errors:
+                    logger.warning(f"{prefix}Console browser [{entry['level']}]: {entry.get('message', '')[:300]}")
+            else:
+                logger.debug(f"{prefix}Console browser: {len(browser_logs)} entradas, nenhum erro.")
+        else:
+            logger.debug(f"{prefix}Console browser: vazio.")
+
+        perf_logs = self.get_performance_logs()
+        dl_events = []
+        for entry in perf_logs:
+            try:
+                msg = json.loads(entry.get('message', '{}'))
+                method = msg.get('message', {}).get('method', '')
+                if any(k in method for k in ['Download', 'Page.download', 'Network.responseReceived']):
+                    params = msg.get('message', {}).get('params', {})
+                    dl_events.append(f"{method}: {str(params)[:200]}")
+            except Exception:
+                continue
+        if dl_events:
+            for ev in dl_events:
+                logger.info(f"{prefix}Evento CDP: {ev}")
+        else:
+            logger.debug(f"{prefix}Nenhum evento de download/resposta nos performance logs.")
 
     def close_browser(self):
         if self.driver:

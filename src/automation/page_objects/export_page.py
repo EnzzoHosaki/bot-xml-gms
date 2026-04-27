@@ -1,4 +1,6 @@
 #page_objects/export_page.py
+import json
+import os
 import shutil
 import time
 import logging
@@ -7,7 +9,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementNotInteractableException, ElementClickInterceptedException
 from .base_page import BasePage
 from config import settings
 from src.utils.exceptions import NoInvoicesFoundException
@@ -49,13 +51,17 @@ class ExportPage(BasePage):
                                 self.send_keys(self.selectors['stores_input'], str(store_code))
                                 option_selector = f"//li[@role='option' and contains(., '{store_code}')]"
                                 _by = self._get_by(option_selector)
-                                # O dropdown re-renderiza após cada seleção; retry protege contra StaleElementReference
+                                # O dropdown re-renderiza após cada seleção; retry protege contra
+                                # StaleElementReference e ElementNotInteractable (Chrome 147+ mais restrito).
                                 for _attempt in range(3):
                                     try:
                                         el = WebDriverWait(self.driver, settings.DEFAULT_TIMEOUT).until(
                                             EC.element_to_be_clickable((_by, option_selector))
                                         )
-                                        el.click()
+                                        try:
+                                            el.click()
+                                        except (ElementNotInteractableException, ElementClickInterceptedException):
+                                            self.driver.execute_script("arguments[0].click();", el)
                                         break
                                     except StaleElementReferenceException:
                                         if _attempt == 2:
@@ -195,21 +201,75 @@ class ExportPage(BasePage):
                 row_classes = first_row_element.get_attribute("class") or ""
                 logger.info(f"Classes da linha após clique: '{row_classes}'")
 
-                # Tentar também clicar no checkbox/input da linha se existir.
-                # O Kendo UI oculta o <input> com CSS — usa JS como fallback se Selenium falhar.
+                # Marcar o checkbox da linha.
+                # O Kendo UI oculta o <input> com opacity:0 — precisa de estratégias especiais.
                 try:
                     checkbox_selector = f"({self.selectors['table_rows']})[3]//input[@type='checkbox']"
                     if self.is_element_present(checkbox_selector, timeout=2):
                         _cb_by = self._get_by(checkbox_selector)
                         checkbox_el = self.driver.find_element(_cb_by, checkbox_selector)
-                        try:
-                            WebDriverWait(self.driver, 5).until(
-                                EC.element_to_be_clickable((_cb_by, checkbox_selector))
-                            )
-                            checkbox_el.click()
-                        except TimeoutException:
-                            self.driver.execute_script("arguments[0].click();", checkbox_el)
-                        logger.info("Checkbox da linha clicado.")
+
+                        is_checked = self.driver.execute_script("return arguments[0].checked", checkbox_el)
+                        if is_checked:
+                            logger.info("Checkbox já está marcado (nenhuma ação necessária).")
+                        else:
+                            # Estratégia 1: clicar no <label> associado (abordagem Kendo UI nativa)
+                            clicked = False
+                            try:
+                                cb_id = checkbox_el.get_attribute("id") or ""
+                                if cb_id:
+                                    label_js = f"return document.querySelector(\"label[for='{cb_id}']\");"
+                                    label_el = self.driver.execute_script(label_js)
+                                else:
+                                    label_el = self.driver.execute_script(
+                                        "return arguments[0].closest('td').querySelector('label');",
+                                        checkbox_el
+                                    )
+                                if label_el:
+                                    label_el.click()
+                                    clicked = True
+                                    logger.info("Label do checkbox (Kendo UI) clicada.")
+                            except Exception:
+                                pass
+
+                            # Estratégia 2: jQuery trigger se disponível na página
+                            if not clicked:
+                                try:
+                                    result = self.driver.execute_script(
+                                        "if(typeof $ !== 'undefined') { $(arguments[0]).prop('checked', true).trigger('click').trigger('change'); return true; } return false;",
+                                        checkbox_el
+                                    )
+                                    if result:
+                                        clicked = True
+                                        logger.info("Checkbox marcado via jQuery trigger.")
+                                except Exception:
+                                    pass
+
+                            # Estratégia 3: MouseEvent nativo com bubbling (compatível com Kendo sem jQuery)
+                            if not clicked:
+                                self.driver.execute_script(
+                                    "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true,view:window}));",
+                                    checkbox_el
+                                )
+                                logger.info("Checkbox clicado via MouseEvent bubbling.")
+
+                            # Verificar se ficou marcado; se ainda não, forçar via prop + change event
+                            time.sleep(0.3)
+                            checkbox_el_ref = self.driver.find_element(_cb_by, checkbox_selector)
+                            is_checked = self.driver.execute_script("return arguments[0].checked", checkbox_el_ref)
+                            if not is_checked:
+                                logger.warning("⚠️ Checkbox ainda não marcado — forçando checked=true via JS e disparando change.")
+                                self.driver.execute_script(
+                                    "arguments[0].checked = true; arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                                    checkbox_el_ref
+                                )
+                                time.sleep(0.2)
+                                is_checked = self.driver.execute_script("return arguments[0].checked", checkbox_el_ref)
+
+                        kendo_selected = 'k-state-selected' in row_classes
+                        logger.info(f"Estado final da seleção: checkbox.checked={is_checked} | linha.k-state-selected={kendo_selected}")
+                        if not is_checked:
+                            logger.warning("⚠️ Checkbox NÃO está marcado após todas as tentativas — o download pode não ser acionado.")
                 except Exception as e:
                     logger.debug(f"Nenhum checkbox encontrado ou não foi possível clicar ({e}).")
 
@@ -225,7 +285,20 @@ class ExportPage(BasePage):
                 if not btn_enabled:
                     logger.warning("⚠️ O botão de download está desabilitado! A linha pode não estar selecionada corretamente.")
                 
-                # Tentar click normal primeiro
+                # Logar HTML do botão antes de clicar para diagnóstico
+                try:
+                    btn_html = download_btn.get_attribute('outerHTML')
+                    logger.debug(f"HTML do botão de download: {btn_html[:300]}")
+                except Exception:
+                    pass
+
+                # Limpar buffer de performance logs antes do clique para capturar apenas eventos pós-clique
+                try:
+                    self.driver.get_log('performance')
+                    self.driver.get_log('browser')
+                except Exception:
+                    pass
+
                 self.click(download_button_selector)
                 logger.info("Clique no botão de download realizado.")
 
@@ -239,6 +312,46 @@ class ExportPage(BasePage):
                     logger.info("Alert aceito.")
                 except TimeoutException:
                     logger.debug("Nenhum alert do browser detectado após click no download.")
+
+                # Aguardar 2s e capturar logs do browser e eventos CDP para verificar se o download foi acionado
+                time.sleep(2)
+                try:
+                    browser_logs = self.driver.get_log('browser')
+                    errors = [e for e in browser_logs if e.get('level') in ('SEVERE', 'WARNING')]
+                    if errors:
+                        for err in errors:
+                            logger.warning(f"Console browser pós-clique download [{err['level']}]: {err.get('message', '')[:300]}")
+                    else:
+                        logger.debug(f"Console browser pós-clique: {len(browser_logs)} entradas, sem erros.")
+                except Exception as log_err:
+                    logger.debug(f"Logs do browser indisponíveis: {log_err}")
+
+                try:
+                    perf_logs = self.driver.get_log('performance')
+                    dl_events = []
+                    net_requests = []
+                    for entry in perf_logs:
+                        try:
+                            msg = json.loads(entry.get('message', '{}'))
+                            method = msg.get('message', {}).get('method', '')
+                            params = msg.get('message', {}).get('params', {})
+                            if any(k in method for k in ['Download', 'Page.download']):
+                                dl_events.append(f"{method}: {str(params)[:200]}")
+                            elif method == 'Network.requestWillBeSent':
+                                url = params.get('request', {}).get('url', '')
+                                if url:
+                                    net_requests.append(url[:150])
+                        except Exception:
+                            continue
+                    if dl_events:
+                        for ev in dl_events:
+                            logger.info(f"🌐 Evento CDP de download detectado: {ev}")
+                    else:
+                        logger.warning("⚠️ Nenhum evento CDP de download detectado nos 2s após o clique.")
+                    if net_requests:
+                        logger.info(f"🌐 Requisições de rede pós-clique ({len(net_requests)}): {net_requests[-3:]}")
+                except Exception as perf_err:
+                    logger.debug(f"Logs de performance indisponíveis: {perf_err}")
 
         except Exception as e:
             logger.error(f"Ocorreu um erro durante o processo de download: {e}")
@@ -265,9 +378,21 @@ class ExportPage(BasePage):
             timeout_seconds = settings.download_timeout
 
         logger.info(f"Monitorando diretório de downloads por até {timeout_seconds} segundos...")
+        logger.info(f"📂 Diretório monitorado: {pending_dir}")
+
+        # Diagnóstico de disco
+        try:
+            total, used, free = shutil.disk_usage(pending_dir)
+            logger.info(f"💾 Espaço em disco: total={total // 1024 // 1024}MB | usado={used // 1024 // 1024}MB | livre={free // 1024 // 1024}MB")
+            if free < 100 * 1024 * 1024:
+                logger.warning(f"⚠️ ATENÇÃO: Espaço em disco crítico! Apenas {free // 1024 // 1024}MB livres — download pode falhar.")
+        except Exception:
+            pass
+
         start_time = time.time()
         download_detected = False
         no_temp_files_since = None
+        _last_screenshot_elapsed = 0
 
         # Snapshot inicial por nome para detectar sobrescrita de arquivo existente.
         initial_snapshot = {}
@@ -366,19 +491,122 @@ class ExportPage(BasePage):
                 logger.debug("Downloads temporários finalizaram, aguardando estabilização de artefatos finais...")
 
             elapsed = int(time.time() - start_time)
-            if elapsed > 0 and elapsed % 30 == 0:
-                logger.info(f"⏳ Aguardando download... ({elapsed}s decorridos)")
+            if elapsed > 0:
+                if not download_detected and elapsed % 15 == 0:
+                    current_files_info = {}
+                    for f in list(pending_dir.glob('*')):
+                        try:
+                            current_files_info[f.name] = f.stat().st_size
+                        except Exception:
+                            current_files_info[f.name] = '?'
+                    logger.info(f"⏳ Nenhum download detectado ainda... ({elapsed}s/{timeout_seconds}s) | Pending: {current_files_info or 'vazio'}")
+                elif download_detected and elapsed % 60 == 0:
+                    current_files_info = {}
+                    for f in list(pending_dir.glob('*')):
+                        try:
+                            current_files_info[f.name] = f.stat().st_size
+                        except Exception:
+                            current_files_info[f.name] = '?'
+                    temp_names = [f.name for f in temp_files]
+                    stable_info = {k: {'hits': v.get('stable_hits', 0), 'size': v.get('size', 0)} for k, v in candidate_stability.items()}
+                    logger.info(f"⏳ Aguardando download... ({elapsed}s/{timeout_seconds}s) | Pending: {current_files_info} | Temp: {temp_names} | Estabilidade: {stable_info}")
+                elif elapsed % 30 == 0:
+                    logger.info(f"⏳ Aguardando download... ({elapsed}s decorridos)")
+
+            # Screenshot periódica a cada 120s para visualizar o estado do browser
+            if elapsed > 0 and elapsed // 120 > _last_screenshot_elapsed // 120:
+                _last_screenshot_elapsed = elapsed
+                try:
+                    screenshots_dir = settings.BASE_DIR / "logs" / "screenshots"
+                    screenshots_dir.mkdir(parents=True, exist_ok=True)
+                    screenshot_path = screenshots_dir / f"download_wait_{elapsed}s_{int(time.time())}.png"
+                    self.driver.save_screenshot(str(screenshot_path))
+                    logger.info(f"📸 Screenshot periódica ({elapsed}s): {screenshot_path}")
+                except Exception:
+                    pass
 
             time.sleep(3)
 
-        # Timeout - capturar estado final para diagnóstico
+        # Timeout - diagnóstico completo
         final_files = list(pending_dir.glob('*'))
-        logger.error(f"❌ Timeout no download! Arquivos em pending após {timeout_seconds}s: {[f.name for f in final_files]}")
-        
+        final_files_info = {}
+        for f in final_files:
+            try:
+                final_files_info[f.name] = f.stat().st_size
+            except Exception:
+                final_files_info[f.name] = '?'
+        logger.error(f"❌ Timeout no download! Arquivos em pending após {timeout_seconds}s: {final_files_info or 'vazio'}")
+        logger.error(f"Estado de rastreamento: download_detected={download_detected} | no_temp_files_since={no_temp_files_since}")
+        if candidate_stability:
+            logger.error(f"Histórico de candidatos: {candidate_stability}")
+        else:
+            logger.error("Nenhum arquivo candidato ao download foi detectado em nenhum momento.")
+
+        # Verificar diretórios alternativos onde o Chrome pode ter salvado
+        try:
+            alt_dirs = [
+                Path(os.path.expanduser("~")),
+                Path(os.path.expanduser("~")) / "Downloads",
+                Path("/tmp"),
+                Path("/root"),
+                Path("/root/Downloads"),
+            ]
+            for alt_dir in alt_dirs:
+                try:
+                    if alt_dir.exists() and alt_dir.resolve() != pending_dir.resolve():
+                        recent = [f for f in alt_dir.glob("*.zip") if f.stat().st_mtime > start_time - 60]
+                        recent += [f for f in alt_dir.glob("*") if f.stat().st_mtime > start_time - 60 and f.is_file()]
+                        if recent:
+                            logger.warning(f"⚠️ Arquivos recentes em diretório alternativo {alt_dir}: {[f.name for f in recent[:10]]}")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Logs do console do browser no momento do timeout
+        try:
+            browser_logs = self.driver.get_log('browser')
+            if browser_logs:
+                logger.error(f"Console do browser no timeout ({len(browser_logs)} entradas):")
+                for entry in browser_logs[-15:]:
+                    logger.error(f"  [{entry.get('level')}] {entry.get('message', '')[:250]}")
+            else:
+                logger.error("Console do browser: vazio (nenhuma entrada). Logging pode não estar habilitado no Chrome.")
+        except Exception as e:
+            logger.error(f"Não foi possível capturar logs do browser: {e}")
+
+        # Eventos CDP de rede/download acumulados
+        try:
+            perf_logs = self.driver.get_log('performance')
+            dl_events = []
+            net_responses = []
+            for entry in perf_logs:
+                try:
+                    msg = json.loads(entry.get('message', '{}'))
+                    method = msg.get('message', {}).get('method', '')
+                    params = msg.get('message', {}).get('params', {})
+                    if any(k in method for k in ['Download', 'Page.download']):
+                        dl_events.append(f"{method}: {str(params)[:150]}")
+                    elif method == 'Network.responseReceived':
+                        url = params.get('response', {}).get('url', '')
+                        status = params.get('response', {}).get('status', '')
+                        if url:
+                            net_responses.append(f"{status} {url[:120]}")
+                except Exception:
+                    continue
+            if dl_events:
+                logger.error(f"Eventos CDP de download detectados: {dl_events}")
+            else:
+                logger.error("Nenhum evento CDP de download detectado em todo o período de espera. O Chrome pode não ter recebido o comando de download.")
+            if net_responses:
+                logger.error(f"Últimas respostas de rede ({len(net_responses)} total): {net_responses[-5:]}")
+        except Exception as e:
+            logger.error(f"Não foi possível capturar logs de performance: {e}")
+
         # Capturar screenshot final
         try:
             self.driver.switch_to.default_content()
-            screenshots_dir = settings.BASE_DIR / "logs" / "screenshots" 
+            screenshots_dir = settings.BASE_DIR / "logs" / "screenshots"
             screenshots_dir.mkdir(parents=True, exist_ok=True)
             screenshot_path = screenshots_dir / f"download_timeout_{int(time.time())}.png"
             self.driver.save_screenshot(str(screenshot_path))

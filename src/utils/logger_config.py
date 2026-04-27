@@ -28,10 +28,14 @@ def setup_logger():
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
 
-    root_logger.addFilter(TaskIdFilter())
+    # O filtro deve ser adicionado aos handlers, não ao logger.
+    # Quando registros de loggers filhos propagam para o root, os filtros do root logger
+    # não são chamados — apenas os filtros dos handlers são executados.
+    task_id_filter = TaskIdFilter()
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
+    console_handler.addFilter(task_id_filter)
     console_handler.setFormatter(log_format)
     root_logger.addHandler(console_handler)
 
@@ -40,19 +44,20 @@ def setup_logger():
         try:
             log_dir = settings.LOGS_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
-            
+
             log_filename = log_dir / "bot_dev.log"
 
             file_handler = logging.handlers.RotatingFileHandler(
-                log_filename, 
+                log_filename,
                 maxBytes=int(os.getenv('LOG_MAX_BYTES', '10485760')),  # 10MB padrão
                 backupCount=int(os.getenv('LOG_BACKUP_COUNT', '5')),
                 encoding='utf-8'
             )
             file_handler.setLevel(log_level)
+            file_handler.addFilter(task_id_filter)
             file_handler.setFormatter(log_format)
             root_logger.addHandler(file_handler)
-            
+
             root_logger.info("✅ LOG_ENV=development - Logs também salvos em: bot_dev.log")
         except Exception as e:
             root_logger.warning(f"⚠️  Falha ao configurar file handler: {e}")
